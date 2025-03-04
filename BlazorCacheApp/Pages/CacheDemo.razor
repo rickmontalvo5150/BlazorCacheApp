@@ -1,0 +1,287 @@
+﻿@page "/cache-demo"
+@using BlazorCacheApp.Services.CacheService
+@using BlazorCacheApp.Services.DemoService
+@inject ICacheService CacheService
+@inject WeatherForecastService WeatherService
+
+<PageTitle>Cache Demo</PageTitle>
+
+<h1>Cache Demo</h1>
+
+<p>This page demonstrates the caching functionality using a sample weather forecast API.</p>
+
+<div class="row">
+    <div class="col-md-6">
+        <div class="card mb-4">
+            <div class="card-header">
+                <h3>Weather Forecast</h3>
+            </div>
+            <div class="card-body">
+                @if (_forecasts == null)
+                {
+                    <p><em>Loading...</em></p>
+                }
+                else
+                {
+                    <p>
+                        <strong>API Call Count: @WeatherService.ApiCallCount</strong>
+                        <span class="ms-2 text-muted">
+                            (Notice this doesn't increase when loading from cache)
+                        </span>
+                    </p>
+                    <table class="table">
+                        <thead>
+                            <tr>
+                                <th>Date</th>
+                                <th>Temp. (C)</th>
+                                <th>Temp. (F)</th>
+                                <th>Summary</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            @foreach (var forecast in _forecasts)
+                            {
+                                <tr>
+                                    <td>@forecast.Date.ToShortDateString()</td>
+                                    <td>@forecast.TemperatureC</td>
+                                    <td>@forecast.TemperatureF</td>
+                                    <td>@forecast.Summary</td>
+                                </tr>
+                            }
+                        </tbody>
+                    </table>
+                }
+            </div>
+            <div class="card-footer">
+                <button class="btn btn-primary" @onclick="LoadForecast">Refresh Data</button>
+                <button class="btn btn-secondary ms-2" @onclick="ClearCacheAndReload">Clear Weather Key & Reload</button>
+            </div>
+        </div>
+    </div>
+
+    <div class="col-md-6">
+        <div class="card mb-4">
+            <div class="card-header">
+                <h3>Cache Controls</h3>
+            </div>
+            <div class="card-body">
+                <div class="mb-3">
+                    <label for="cacheKey" class="form-label">Cache Key:</label>
+                    <input id="cacheKey" class="form-control" @bind="_customKey" />
+                </div>
+                <div class="mb-3">
+                    <label for="cacheValue" class="form-label">Cache Value:</label>
+                    <input id="cacheValue" class="form-control" @bind="_customValue" />
+                </div>
+                <div class="mb-3">
+                    <label for="expiration" class="form-label">Expiration (seconds):</label>
+                    <input id="expiration" type="number" class="form-control" @bind="_expirationSeconds" />
+                </div>
+                <div class="mb-3">
+                    <button class="btn btn-primary" @onclick="SetCustomCache">Set Custom Value</button>
+                    <button class="btn btn-secondary ms-2" @onclick="GetCustomCache">Get Custom Value</button>
+                    <button class="btn btn-danger ms-2" @onclick="RemoveCustomCache">Remove</button>
+                </div>
+                <div class="alert @(string.IsNullOrEmpty(_customResultMessage) ? "d-none" : _customResultClass)">
+                    @_customResultMessage
+                </div>
+            </div>
+        </div>
+
+        <div class="card mb-4">
+            <div class="card-header">
+                <h3>Cache Statistics</h3>
+                <button class="btn btn-sm btn-outline-secondary float-end" @onclick="RefreshStatistics">
+                    Refresh
+                </button>
+            </div>
+            <div class="card-body">
+                @if (_cacheStats == null)
+                {
+                    <p><em>Loading statistics...</em></p>
+                }
+                else
+                {
+                    <dl class="row">
+                        <dt class="col-sm-6">Total Items:</dt>
+                        <dd class="col-sm-6">@_cacheStats.TotalItems</dd>
+
+                        <dt class="col-sm-6">Expired Items:</dt>
+                        <dd class="col-sm-6">@_cacheStats.ExpiredItems</dd>
+
+                        <dt class="col-sm-6">Estimated Size:</dt>
+                        <dd class="col-sm-6">@FormatBytes(_cacheStats.EstimatedSizeBytes)</dd>
+
+                        <dt class="col-sm-6">Last Cleanup:</dt>
+                        <dd class="col-sm-6">@_cacheStats.LastCleanupTime.ToLocalTime().ToString("g")</dd>
+                    </dl>
+
+                    <h4 class="mt-4">Cache Keys</h4>
+                    @if (_cacheKeys?.Any() != true)
+                    {
+                        <p><em>No items in cache</em></p>
+                    }
+                    else
+                    {
+                        <ul class="list-group">
+                            @foreach (var key in _cacheKeys)
+                            {
+                                <li class="list-group-item">@key</li>
+                            }
+                        </ul>
+                    }
+                }
+            </div>
+            <div class="card-footer">
+                <button class="btn btn-warning" @onclick="CleanupCache">Run Cleanup</button>
+                <button class="btn btn-danger ms-2" @onclick="ClearAllCache">Clear All Cache</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+@code {
+    private WeatherForecast[]? _forecasts;
+    private CacheStatistics? _cacheStats;
+    private IEnumerable<string>? _cacheKeys;
+    
+    // For custom cache demo
+    private string _customKey = "demo-key";
+    private string _customValue = "This is a test value";
+    private int _expirationSeconds = 30;
+    private string? _customResultMessage;
+    private string _customResultClass = "alert-info";
+    
+    // Cache key for weather data
+    private const string WeatherCacheKey = "weather-forecast";
+    
+    protected override async Task OnInitializedAsync()
+    {
+        await LoadForecast();
+        await RefreshStatistics();
+    }
+    
+    private async Task LoadForecast()
+    {
+        // Try to get from cache first
+        _forecasts = await CacheService.GetAsync<WeatherForecast[]>(WeatherCacheKey);
+        
+        // If not in cache or expired, load from API
+        if (_forecasts == null)
+        {
+            _forecasts = await WeatherService.GetForecastAsync(DateTime.Now);
+            
+            // Cache with 30 second expiration
+            await CacheService.SetAsync(WeatherCacheKey, _forecasts, TimeSpan.FromSeconds(10));
+        }
+
+        await RefreshStatistics();
+    }
+    
+    private async Task ClearCacheAndReload()
+    {
+        await CacheService.RemoveAsync(WeatherCacheKey);
+        await LoadForecast();
+    }
+    
+    private async Task RefreshStatistics()
+    {
+        _cacheStats = await CacheService.GetStatisticsAsync();
+        _cacheKeys = await CacheService.GetAllKeysAsync();
+    }
+    
+    private async Task SetCustomCache()
+    {
+        try
+        {
+            TimeSpan? expiration = _expirationSeconds > 0 
+                ? TimeSpan.FromSeconds(_expirationSeconds)
+                : null;
+                
+            await CacheService.SetAsync(_customKey, _customValue, expiration);
+            
+            _customResultMessage = "Value cached successfully! " + 
+                (expiration.HasValue ? $"Expires in {_expirationSeconds} seconds." : "Never expires.");
+            _customResultClass = "alert-success";
+            
+            await RefreshStatistics();
+        }
+        catch (Exception ex)
+        {
+            _customResultMessage = $"Error: {ex.Message}";
+            _customResultClass = "alert-danger";
+        }
+    }
+    
+    private async Task GetCustomCache()
+    {
+        try
+        {
+            var value = await CacheService.GetAsync<string>(_customKey);
+            
+            if (value != null)
+            {
+                _customResultMessage = $"Retrieved value: {value}";
+                _customValue = value;
+            }
+            else
+            {
+                _customResultMessage = "Key not found in cache or expired.";
+            }
+            
+            _customResultClass = "alert-info";
+        }
+        catch (Exception ex)
+        {
+            _customResultMessage = $"Error: {ex.Message}";
+            _customResultClass = "alert-danger";
+        }
+    }
+    
+    private async Task RemoveCustomCache()
+    {
+        try
+        {
+            await CacheService.RemoveAsync(_customKey);
+            _customResultMessage = $"Key '{_customKey}' removed from cache.";
+            _customResultClass = "alert-warning";
+            await RefreshStatistics();
+        }
+        catch (Exception ex)
+        {
+            _customResultMessage = $"Error: {ex.Message}";
+            _customResultClass = "alert-danger";
+        }
+    }
+    
+    private async Task CleanupCache()
+    {
+        await CacheService.CleanExpiredItemsAsync();
+        _customResultMessage = "Cache cleanup completed.";
+        _customResultClass = "alert-info";
+        await RefreshStatistics();
+    }
+    
+    private async Task ClearAllCache()
+    {
+        await CacheService.ClearAsync();
+        _customResultMessage = "All cache items cleared.";
+        _customResultClass = "alert-warning";
+        await RefreshStatistics();
+    }
+    
+    private static string FormatBytes(long bytes)
+    {
+        string[] suffixes = ["B", "KB", "MB", "GB"];
+        var counter = 0;
+        decimal number = bytes;
+        
+        while (Math.Round(number / 1024) >= 1)
+        {
+            number /= 1024;
+            counter++;
+        }
+        
+        return $"{number:n1} {suffixes[counter]}";
+    }
+}

@@ -1,0 +1,61 @@
+﻿@page "/"
+
+<PageTitle>Blazor Cache Demo</PageTitle>
+
+<h1>Welcome to Blazor Cache Demo</h1>
+
+<p>
+    This sample application demonstrates how to use the local storage cache service in Blazor.
+</p>
+
+<p>
+    Navigate to the <a href="/cache-demo">Cache Demo</a> page to see the cache in action.
+</p>
+
+<h2>Key Features</h2>
+
+<ul>
+    <li>Automatic or manual expiration of cached items</li>
+    <li>Background cleanup of expired items</li>
+    <li>Cache metrics and statistics</li>
+    <li>Type-safe storage and retrieval</li>
+    <li>Full control over cache configuration</li>
+</ul>
+
+<h2>How to Use</h2>
+
+<p>
+    Inject the <code>ICacheService</code> interface into your components:
+</p>
+
+<pre>
+    @("@inject ICacheService CacheService")
+</pre>
+
+<p>
+    Then use the service methods to store, retrieve, and manage cached data:
+</p>
+
+<pre>
+// Store data with custom expiration time
+await CacheService.SetAsync("myKey", myData, TimeSpan.FromMinutes(30));
+
+// Retrieve data
+var data = await CacheService.GetAsync&lt;MyType&gt;("myKey");
+
+// Check if a key exists
+if (await CacheService.ExistsAsync("myKey"))
+{
+    // Do something
+}
+
+// Remove a specific item
+await CacheService.RemoveAsync("myKey");
+
+// Clear the entire cache
+await CacheService.ClearAsync();
+</pre>
+
+<p>
+    Go to the demo page to see these features in action.
+</p>
