@@ -11,7 +11,8 @@ public class LocalStorageCacheService : ICacheService, IAsyncDisposable
     private readonly CacheConfiguration _config;
     private readonly PeriodicTimer? _cleanupTimer;
     private DateTime _lastCleanupTime = DateTime.UtcNow;
-    
+    private readonly CancellationTokenSource? _cleanupCts;
+
     public LocalStorageCacheService(
         IJSRuntime jsRuntime, 
         IOptions<CacheConfiguration> config)
@@ -23,8 +24,14 @@ public class LocalStorageCacheService : ICacheService, IAsyncDisposable
             PropertyNameCaseInsensitive = true
         };
 
-        if (!_config.AutomaticExpirationCleanup) return;
+        if (!_config.AutomaticExpirationCleanup)
+        {
+            return;
+        }
         _cleanupTimer = new PeriodicTimer(_config.CleanupInterval);
+        _cleanupCts = new CancellationTokenSource();
+
+        // Start the cleanup timer with proper cancellation support
         _ = StartCleanupTimer();
     }
 
@@ -39,23 +46,43 @@ public class LocalStorageCacheService : ICacheService, IAsyncDisposable
     {
         try
         {
-            while (await _cleanupTimer!.WaitForNextTickAsync())
+            try
             {
-                await CleanExpiredItemsAsync();
+                while (await _cleanupTimer!.WaitForNextTickAsync(_cleanupCts!.Token))
+                {
+                    await CleanExpiredItemsAsync();
+                    _lastCleanupTime = DateTime.UtcNow;
+                }
             }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                // Log the error but don't stop the timer
+                System.Diagnostics.Debug.WriteLine($"Error during scheduled cleanup: {ex.Message}");
+            }
+            
         }
         catch (OperationCanceledException)
         {
-            // Timer was disposed
+            // Timer was cancelled, this is expected
+            System.Diagnostics.Debug.WriteLine("Cleanup timer was cancelled");
+        }
+        catch (Exception ex)
+        {
+            // Log unexpected exceptions
+            System.Diagnostics.Debug.WriteLine($"Unexpected error in cleanup timer: {ex.Message}");
         }
     }
 
     public async Task<T?> GetAsync<T>(string key)
     {
+        if (string.IsNullOrEmpty(key))
+            throw new ArgumentException("Cache key cannot be null or empty", nameof(key));
+        
         try
         {
-            var json = await _jsRuntime.InvokeAsync<string>("localStorage.getItem", GetPrefixedKey(key));
-            
+            var prefixedKey = GetPrefixedKey(key);
+            var json = await _jsRuntime.InvokeAsync<string>("localStorage.getItem", prefixedKey);
+        
             if (string.IsNullOrEmpty(json))
                 return default;
 
@@ -64,13 +91,22 @@ public class LocalStorageCacheService : ICacheService, IAsyncDisposable
             if (cacheItem == null)
                 return default;
 
-            if (!cacheItem.IsExpired) return cacheItem.Value;
+            if (!cacheItem.IsExpired)
+                return cacheItem.Value;
+            
+            // Item is expired - remove it
+            System.Diagnostics.Debug.WriteLine($"Cache item '{key}' was accessed but found expired");
             await RemoveAsync(key);
             return default;
-
         }
-        catch
+        catch (JsonException ex)
         {
+            System.Diagnostics.Debug.WriteLine($"Error deserializing cache item '{key}': {ex.Message}");
+            return default;
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine($"Unexpected error accessing cache item '{key}': {ex.Message}");
             return default;
         }
     }
@@ -125,39 +161,49 @@ public class LocalStorageCacheService : ICacheService, IAsyncDisposable
 
     public async Task<bool> ExistsAsync(string key)
     {
+        if (string.IsNullOrEmpty(key))
+            throw new ArgumentException("Cache key cannot be null or empty", nameof(key));
+        
         try
         {
-            var json = await _jsRuntime.InvokeAsync<string>("localStorage.getItem", GetPrefixedKey(key));
+            var prefixedKey = GetPrefixedKey(key);
+            var json = await _jsRuntime.InvokeAsync<string>("localStorage.getItem", prefixedKey);
+        
             if (string.IsNullOrEmpty(json))
                 return false;
-                
-            // Try to parse and check if expired
+            
+            // Use JsonDocument for lightweight parsing to check expiration
             try
             {
                 using var document = JsonDocument.Parse(json);
-                
-                if (document.RootElement.TryGetProperty("expirationTime", out var expirationElement))
+
+                if (!document.RootElement.TryGetProperty("expirationTime", out var expirationElement) ||
+                    expirationElement.ValueKind != JsonValueKind.String ||
+                    !DateTime.TryParse(expirationElement.GetString(), out var expirationTime))
                 {
-                    if (expirationElement.ValueKind == JsonValueKind.String &&
-                        DateTime.TryParse(expirationElement.GetString(), out var expirationTime))
-                    {
-                        if (DateTime.UtcNow > expirationTime)
-                        {
-                            await RemoveAsync(key);
-                            return false;
-                        }
-                    }
+                    return true;
                 }
+
+                if (DateTime.UtcNow <= expirationTime)
+                {
+                    return true;
+                }
+
+                System.Diagnostics.Debug.WriteLine($"Cache item '{key}' exists but is expired");
+                // Remove expired item asynchronously without awaiting
+                _ = RemoveAsync(key);
+                return false;
+
             }
-            catch
+            catch (JsonException ex)
             {
-                // If we can't parse it, or it doesn't match our format, just return true
+                System.Diagnostics.Debug.WriteLine($"Error parsing cache item '{key}': {ex.Message}");
+                return true; // If we can't parse it, assume it exists but may not be our format
             }
-            
-            return true;
         }
-        catch
+        catch (Exception ex)
         {
+            System.Diagnostics.Debug.WriteLine($"Error checking existence of cache item '{key}': {ex.Message}");
             return false;
         }
     }
@@ -170,33 +216,61 @@ public class LocalStorageCacheService : ICacheService, IAsyncDisposable
             
             // Get all keys that start with our prefix
             var prefixedKeys = await GetPrefixedKeysAsync();
+            var removedCount = 0;
+            var totalCount = prefixedKeys.Count;
+            
+            System.Diagnostics.Debug.WriteLine($"Starting cleanup of {totalCount} potential cache items");
             
             foreach (var prefixedKey in prefixedKeys)
             {
-                var json = await _jsRuntime.InvokeAsync<string>("localStorage.getItem", prefixedKey);
-                if (string.IsNullOrEmpty(json)) continue;
                 try
                 {
-                    using var document = JsonDocument.Parse(json);
-                        
-                    if (document.RootElement.TryGetProperty("expirationTime", out var expirationElement))
+                    var json = await _jsRuntime.InvokeAsync<string>("localStorage.getItem", prefixedKey);
+                    if (string.IsNullOrEmpty(json))
                     {
-                        if (expirationElement.ValueKind == JsonValueKind.String &&
-                            DateTime.TryParse(expirationElement.GetString(), out var expirationTime))
-                        {
-                            if (DateTime.UtcNow > expirationTime)
-                            {
-                                await _jsRuntime.InvokeVoidAsync("localStorage.removeItem", prefixedKey);
-                            }
-                        }
+                        continue;
                     }
+                    
+                    using var document = JsonDocument.Parse(json);
+
+                    if (!document.RootElement.TryGetProperty("expirationTime", out var expirationElement) ||
+                        expirationElement.ValueKind != JsonValueKind.String ||
+                        !DateTime.TryParse(expirationElement.GetString(), out var expirationTime))
+                    {
+                        continue;
+                    }
+
+                    if (DateTime.UtcNow <= expirationTime)
+                    {
+                        continue;
+                    }
+                    await _jsRuntime.InvokeVoidAsync("localStorage.removeItem", prefixedKey);
+                    removedCount++;
                 }
-                catch (JsonException)
+                catch (JsonException ex)
                 {
                     // Skip items that aren't valid JSON or don't match our format
-                    System.Diagnostics.Debug.WriteLine($"Error cleaning cache item: {prefixedKey}");
+                    System.Diagnostics.Debug.WriteLine($"Error parsing cache item during cleanup: {prefixedKey}, {ex.Message}");
+                }
+                catch (JSException ex)
+                {
+                    // Handle JavaScript errors separately
+                    System.Diagnostics.Debug.WriteLine($"JavaScript error during cleanup: {prefixedKey}, {ex.Message}");
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    // Log other errors but continue with next items
+                    System.Diagnostics.Debug.WriteLine($"Unexpected error cleaning cache item: {prefixedKey}, {ex.Message}");
                 }
             }
+            
+            System.Diagnostics.Debug.WriteLine($"Cleanup completed: removed {removedCount} of {totalCount} items");
+        }
+        catch (OperationCanceledException)
+        {
+            // Cleanup was cancelled
+            System.Diagnostics.Debug.WriteLine("Cache cleanup was cancelled");
+            throw;
         }
         catch (Exception ex)
         {
@@ -210,6 +284,16 @@ public class LocalStorageCacheService : ICacheService, IAsyncDisposable
         {
             var allKeys = await _jsRuntime.InvokeAsync<string[]>("getCacheKeys");
             return allKeys.Where(k => k.StartsWith(CacheConfiguration.KeyPrefix)).ToList();
+        }
+        catch (OperationCanceledException)
+        {
+            // Operation was canceled
+            throw;
+        }
+        catch (JSException ex)
+        {
+            System.Diagnostics.Debug.WriteLine($"JavaScript error getting prefixed keys: {ex.Message}");
+            return [];
         }
         catch (Exception ex)
         {
@@ -269,27 +353,41 @@ public class LocalStorageCacheService : ICacheService, IAsyncDisposable
                         }
                     }
                 }
-                catch
+                catch (JsonException ex)
                 {
                     // Skip invalid items, if any
+                    System.Diagnostics.Debug.WriteLine($"Error parsing cache item during statistics gathering: {key}, {ex.Message}");
                 }
             }
         }
-        catch
+        catch (Exception ex)
         {
             // Handle errors, possibly log them
+            System.Diagnostics.Debug.WriteLine($"Error gathering cache statistics: {ex.Message}");
         }
         
         return stats;
     }
 
-    async ValueTask IAsyncDisposable.DisposeAsync()
+    public async ValueTask DisposeAsync()
     {
-        if (_cleanupTimer != null)
+        try
         {
-            await ValueTask.CompletedTask; // Just to maintain the async signature
-            _cleanupTimer.Dispose();
+            // Cancel the cleanup task first
+            if (_cleanupCts != null)
+            {
+                await _cleanupCts.CancelAsync();
+                _cleanupCts.Dispose();
+            }
+        
+            // Then dispose the timer
+            _cleanupTimer?.Dispose();
         }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine($"Error during cache service disposal: {ex.Message}");
+        }
+    
         GC.SuppressFinalize(this);
     }
 }

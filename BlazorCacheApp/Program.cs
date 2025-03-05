@@ -9,9 +9,9 @@ builder.Services.AddServerSideBlazor();
 
 // Add the cache service with configuration
 builder.Services.AddLocalStorageCache(options => {
-    options.DefaultExpirationTime = TimeSpan.FromMinutes(10);
+    options.DefaultExpirationTime = TimeSpan.FromMinutes(5);
     options.AutomaticExpirationCleanup = true;
-    options.CleanupInterval = TimeSpan.FromMinutes(15);
+    options.CleanupInterval = TimeSpan.FromMinutes(5);
 });
 
 // Add demo service

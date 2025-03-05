@@ -3,6 +3,7 @@
 @using BlazorCacheApp.Services.DemoService
 @inject ICacheService CacheService
 @inject WeatherForecastService WeatherService
+@implements IDisposable
 
 <PageTitle>Cache Demo</PageTitle>
 
@@ -152,42 +153,169 @@
     private string? _customResultMessage;
     private string _customResultClass = "alert-info";
     
+    private CancellationTokenSource? _removeCustomCacheCts;
+    private CancellationTokenSource? _clearAllCacheCts;
+    private CancellationTokenSource? _cleanupCacheCts;
+    private CancellationTokenSource? _initCts;
+    private CancellationTokenSource? _clearAndReloadCts;
+    private CancellationTokenSource? _refreshStatsCts;
+    
     // Cache key for weather data
     private const string WeatherCacheKey = "weather-forecast";
     
     protected override async Task OnInitializedAsync()
     {
-        await LoadForecast();
-        await RefreshStatistics();
+        try
+        {
+            var cts = GetNewTokenSource(ref _initCts, "initialization");
+        
+            // Run both operations in parallel
+            var forecastTask = LoadForecast();
+            var statsTask = RefreshStatistics();
+        
+            var combinedTask = Task.WhenAll(forecastTask, statsTask);
+        
+            // Use token for timeout - though we can't cancel the individual operations
+            await combinedTask.WaitAsync(cts.Token);
+        }
+        catch (OperationCanceledException)
+        {
+            System.Diagnostics.Debug.WriteLine("Initialization was canceled");
+            _customResultMessage = "Page initialization was canceled or timeded out.";
+            _customResultClass = "alert-warning";
+        }
+        catch (Exception ex)
+        {
+            _customResultMessage = $"Error initializing page: {ex.Message}";
+            System.Diagnostics.Debug.WriteLine($"Error in OnInitializedAsync: {ex}");
+        }
+        finally
+        {
+            StateHasChanged();
+        }
+    }
+    
+    private static CancellationTokenSource GetNewTokenSource(ref CancellationTokenSource? currentCts, string operationName)
+    {
+        // Cancel any previous operation
+        if (currentCts != null)
+        {
+            try
+            {
+                currentCts.Cancel(); // Synchronous cancel instead of async
+            }
+            catch (Exception ex)
+            {
+                // Ignore cancellation errors but log them
+                System.Diagnostics.Debug.WriteLine($"Error canceling {operationName} operation: {ex.Message}");
+            }
+            currentCts.Dispose();
+        }
+    
+        currentCts = new CancellationTokenSource();
+        return currentCts;
     }
     
     private async Task LoadForecast()
     {
-        // Try to get from cache first
-        _forecasts = await CacheService.GetAsync<WeatherForecast[]>(WeatherCacheKey);
-        
-        // If not in cache or expired, load from API
-        if (_forecasts == null)
+        try
         {
-            _forecasts = await WeatherService.GetForecastAsync(DateTime.Now);
+            // Try to get from cache first
+            _forecasts = await CacheService.GetAsync<WeatherForecast[]>(WeatherCacheKey);
+        
+            // If not in cache or expired, load from API
+            if (_forecasts == null)
+            {
+                _forecasts = await WeatherService.GetForecastAsync(DateTime.Now);
             
-            // Cache with 30 second expiration
-            await CacheService.SetAsync(WeatherCacheKey, _forecasts, TimeSpan.FromSeconds(10));
+                // Cache with 10 second expiration
+                await CacheService.SetAsync(WeatherCacheKey, _forecasts, TimeSpan.FromSeconds(10));
+            }
         }
-
-        await RefreshStatistics();
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine($"Error in LoadForecast: {ex}");
+            _customResultMessage = "Error loading forecast data";
+            _customResultClass = "alert-danger";
+        
+            // Make sure we don't have partially loaded data
+            _forecasts = null;
+        }
+        finally
+        {
+            StateHasChanged();
+        }
     }
     
     private async Task ClearCacheAndReload()
     {
-        await CacheService.RemoveAsync(WeatherCacheKey);
-        await LoadForecast();
+        try
+        {
+            var cts = GetNewTokenSource(ref _clearAndReloadCts, "clear and reload");
+        
+            // Set loading state
+            _customResultMessage = "Clearing cache and reloading...";
+            _customResultClass = "alert-info";
+        
+            // First remove from cache
+            var removeTask = CacheService.RemoveAsync(WeatherCacheKey);
+        
+            // Wait for removal with timeout/cancellation
+            await removeTask.WaitAsync(cts.Token);
+        
+            // Then load forecast
+            await LoadForecast();
+        }
+        catch (OperationCanceledException)
+        {
+            System.Diagnostics.Debug.WriteLine("Clear and reload operation was canceled");
+            _customResultMessage = "Clearing cache operation canceled.";
+            _customResultClass = "alert-warning";
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine($"Error in ClearCacheAndReload: {ex}");
+            _customResultMessage = "Error clearing and reloading cache";
+            _customResultClass = "alert-danger";
+        }
+        finally
+        {
+            StateHasChanged();
+        }
     }
     
     private async Task RefreshStatistics()
     {
-        _cacheStats = await CacheService.GetStatisticsAsync();
-        _cacheKeys = await CacheService.GetAllKeysAsync();
+        try
+        {
+            var cts = GetNewTokenSource(ref _refreshStatsCts, "refresh statistics");
+        
+            // Run both operations in parallel
+            var statsTask = CacheService.GetStatisticsAsync();
+            var keysTask = CacheService.GetAllKeysAsync();
+        
+            // Wait for both tasks with cancellation support
+            await Task.WhenAll(statsTask, keysTask).WaitAsync(cts.Token);
+        
+            // Only update the UI if the operation wasn't cancelled
+            if (!cts.IsCancellationRequested)
+            {
+                _cacheStats = await statsTask;
+                _cacheKeys = await keysTask;
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            System.Diagnostics.Debug.WriteLine("Statistics refresh was canceled");
+            _customResultMessage = "Statistics refresh was canceled.";
+            _customResultClass = "alert-warning";
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine($"Error refreshing statistics: {ex.Message}");
+            _customResultMessage = "Error refreshing statistics";
+            _customResultClass = "alert-danger";
+        }
     }
     
     private async Task SetCustomCache()
@@ -208,7 +336,8 @@
         }
         catch (Exception ex)
         {
-            _customResultMessage = $"Error: {ex.Message}";
+            System.Diagnostics.Debug.WriteLine($"Error in SetCustomCache: {ex.Message}");
+            _customResultMessage = "Error setting custom cache";
             _customResultClass = "alert-danger";
         }
     }
@@ -233,7 +362,8 @@
         }
         catch (Exception ex)
         {
-            _customResultMessage = $"Error: {ex.Message}";
+            System.Diagnostics.Debug.WriteLine($"Error in GetCustomCache:  {ex.Message}");
+            _customResultMessage = "Error in getting customer cache";
             _customResultClass = "alert-danger";
         }
     }
@@ -242,32 +372,151 @@
     {
         try
         {
-            await CacheService.RemoveAsync(_customKey);
+            var cts = GetNewTokenSource(ref _removeCustomCacheCts, "remove custom cache");
+        
+            // Set loading state
+            _customResultMessage = "Removing from cache...";
+            _customResultClass = "alert-info";
+            StateHasChanged();
+        
+            // Remove from cache
+            var removeTask = CacheService.RemoveAsync(_customKey);
+            await removeTask.WaitAsync(cts.Token);
+        
+            // Update UI state
             _customResultMessage = $"Key '{_customKey}' removed from cache.";
             _customResultClass = "alert-warning";
-            await RefreshStatistics();
+        
+            // Refresh statistics
+            var statsTask = RefreshStatistics();
+            await statsTask.WaitAsync(cts.Token);
+        }
+        catch (OperationCanceledException)
+        {
+            System.Diagnostics.Debug.WriteLine("Removing from custom cache canceled");
+            _customResultMessage = "Removing from custom cache canceled";
+            _customResultClass = "alert-warning";
         }
         catch (Exception ex)
         {
-            _customResultMessage = $"Error: {ex.Message}";
+            System.Diagnostics.Debug.WriteLine($"Error in RemoveCustomCache:  {ex.Message}");
+            _customResultMessage = "Error removing from custom cache";
             _customResultClass = "alert-danger";
+        }
+        finally
+        {
+            StateHasChanged();
         }
     }
     
     private async Task CleanupCache()
     {
-        await CacheService.CleanExpiredItemsAsync();
-        _customResultMessage = "Cache cleanup completed.";
-        _customResultClass = "alert-info";
-        await RefreshStatistics();
+        try
+        {
+            // Cancel any previous operation
+            if (_cleanupCacheCts != null)
+            {
+                try
+                {
+                    await _cleanupCacheCts.CancelAsync();
+                }
+                catch
+                {
+                    // Ignore cancellation errors
+                }
+                _cleanupCacheCts.Dispose();
+            }
+        
+            _cleanupCacheCts = new CancellationTokenSource();
+            var token = _cleanupCacheCts.Token;
+        
+            // Set loading state
+            _customResultMessage = "Cleaning up expired cache items...";
+            _customResultClass = "alert-info";
+        
+            // Clean expired items
+            var cleanupTask = CacheService.CleanExpiredItemsAsync();
+            await cleanupTask.WaitAsync(token);
+        
+            // Update UI state
+            _customResultMessage = "Cache cleanup completed.";
+            _customResultClass = "alert-success";
+        
+            // Refresh statistics
+            var statsTask = RefreshStatistics();
+            await statsTask.WaitAsync(token);
+        }
+        catch (OperationCanceledException)
+        {
+            System.Diagnostics.Debug.WriteLine("Cleanup operation was canceled");
+            _customResultMessage = "Cleanup operation was canceled";
+            _customResultClass = "alert-warning";
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine($"Error in CleanupCache: {ex}");
+            _customResultMessage = "Error during cache cleanup";
+            _customResultClass = "alert-danger";
+        }
+        finally
+        {
+            StateHasChanged();
+        }
     }
     
     private async Task ClearAllCache()
     {
-        await CacheService.ClearAsync();
-        _customResultMessage = "All cache items cleared.";
-        _customResultClass = "alert-warning";
-        await RefreshStatistics();
+        try
+        {
+            // Cancel any previous operation
+            if (_clearAllCacheCts != null)
+            {
+                try
+                {
+                    await _clearAllCacheCts.CancelAsync();
+                }
+                catch
+                {
+                    // Ignore cancellation errors
+                }
+                _clearAllCacheCts.Dispose();
+            }
+        
+            _clearAllCacheCts = new CancellationTokenSource();
+            var token = _clearAllCacheCts.Token;
+        
+            // Set loading state
+            _customResultMessage = "Clearing all cache items...";
+            _customResultClass = "alert-info";
+        
+            // Clear all cache
+            var clearTask = CacheService.ClearAsync();
+            await clearTask.WaitAsync(token);
+        
+            // Update UI state
+            _customResultMessage = "All cache items cleared.";
+            _customResultClass = "alert-warning";
+        
+            // Refresh statistics
+            var statsTask = RefreshStatistics();
+            await statsTask.WaitAsync(token);
+        }
+        catch (OperationCanceledException)
+        {
+            System.Diagnostics.Debug.WriteLine("Clear all cache canceled");
+            _customResultMessage = "Clear all cache canceled.";
+            _customResultClass = "alert-warning";
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine($"Error in ClearAllCache: {ex}");
+            _customResultMessage = $"Error clearing cache: {ex.Message}";
+            _customResultClass = "alert-danger";
+        }
+        finally
+        {
+            StateHasChanged();
+        }
     }
     
     private static string FormatBytes(long bytes)
@@ -283,5 +532,32 @@
         }
         
         return $"{number:n1} {suffixes[counter]}";
+    }
+    
+    public void Dispose()
+    {
+        SafeDispose(ref _initCts, "initialization");
+        SafeDispose(ref _clearAndReloadCts, "clear and reload");
+        SafeDispose(ref _removeCustomCacheCts, "remove custom cache");
+        SafeDispose(ref _cleanupCacheCts, "cleanup cache");
+        SafeDispose(ref _clearAllCacheCts, "clear all cache");
+        SafeDispose(ref _refreshStatsCts, "refresh statistics");
+    }
+
+    static void SafeDispose(ref CancellationTokenSource? cts, string name)
+    {
+        try
+        {
+            cts?.Cancel();
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine($"Error canceling {name}: {ex.Message}");
+        }
+        finally
+        {
+            cts?.Dispose();
+            cts = null;
+        }
     }
 }
